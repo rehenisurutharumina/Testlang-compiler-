@@ -1,0 +1,112 @@
+/* JFlex specification for TestLang++ */
+import java_cup.runtime.Symbol;
+import java.util.HashMap;
+import java.util.Map;
+
+%%
+
+%public
+%class Yylex
+%unicode
+%cup
+%line
+%column
+
+%{
+
+  // Reserved keywords
+  private static final Map<String,Integer> KEYWORDS = new HashMap<>();
+  static {
+    KEYWORDS.put("config",   sym.CONFIG);
+    KEYWORDS.put("base_url", sym.BASE_URL);
+    KEYWORDS.put("header",   sym.HEADER);
+    KEYWORDS.put("let",      sym.LET);
+    KEYWORDS.put("test",     sym.TEST);
+    KEYWORDS.put("GET",      sym.GET);
+    KEYWORDS.put("POST",     sym.POST);
+    KEYWORDS.put("PUT",      sym.PUT);
+    KEYWORDS.put("DELETE",   sym.DELETE);
+    KEYWORDS.put("expect",   sym.EXPECT);
+    KEYWORDS.put("status",   sym.STATUS);
+    KEYWORDS.put("body",     sym.BODY);
+    KEYWORDS.put("contains", sym.CONTAINS);
+  }
+
+  // 1-based position helpers
+  public int getLine()   { return yyline + 1; }
+  public int getColumn() { return yycolumn + 1; }
+
+  private Symbol sym(int id) { return new Symbol(id, getLine(), getColumn()); }
+  private Symbol sym(int id, Object val) { return new Symbol(id, getLine(), getColumn(), val); }
+
+  private void lexError(String msg) {
+    throw new RuntimeException("Lexical error at line " + getLine() + ", column " + getColumn() + ": " + msg);
+  }
+
+  // buffer for building STRING token values
+  private StringBuilder stringBuf;
+%}
+
+/* exclusive state for inside a string literal */
+%x STRING
+
+/* ---------- macros ---------- */
+NEWLINE       = \r\n|\r|\n
+WS            = [ \t\f]+
+DIGIT         = [0-9]
+IDENT_START   = [A-Za-z_]
+IDENT_PART    = [A-Za-z0-9_]
+ESC_QUOTE     = \\"
+ESC_BSLASH    = \\\\
+
+%%
+
+/* whitespace and newlines */
+{WS}                 { /* ignore */ }
+{NEWLINE}            { /* jflex updates %line/%column */ }
+
+/* line comments */
+"//".*               { /* ignore */ }
+
+/* punctuation used by grammar */
+"{"                  { return sym(sym.LBRACE); }
+"}"                  { return sym(sym.RBRACE); }
+";"                  { return sym(sym.SEMI); }
+"="                  { return sym(sym.EQ); }
+
+/* numbers: non-negative integers */
+{DIGIT}+             { return sym(sym.NUMBER, Integer.parseInt(yytext())); }
+
+/* identifiers and reserved keywords */
+{IDENT_START}{IDENT_PART}* {
+  Integer kw = KEYWORDS.get(yytext());
+  if (kw != null) return sym(kw);
+  return sym(sym.IDENT, yytext());
+}
+
+/* start of STRING */
+\"                   { stringBuf = new StringBuilder(); yybegin(STRING); }
+
+<STRING>{
+  {ESC_QUOTE}        { stringBuf.append('\"'); }
+  {ESC_BSLASH}       { stringBuf.append('\\'); }
+
+  /* any other backslash sequence: keep literally */
+  \\[^]              { stringBuf.append(yytext()); }
+
+  /* normal chunk */
+  [^\\\"\r\n]+       { stringBuf.append(yytext()); }
+
+  /* closing quote → emit STRING */
+  \"                 { yybegin(YYINITIAL); return sym(sym.STRING, stringBuf.toString()); }
+
+  /* newline or EOF inside string → error */
+  {NEWLINE}          { lexError("Unterminated string literal"); }
+  <<EOF>>            { lexError("Unterminated string literal"); }
+}
+
+/* unexpected character */
+.                    { lexError("Unexpected character '" + yytext() + "'"); }
+
+/* EOF */
+<<EOF>>              { return new Symbol(sym.EOF); }

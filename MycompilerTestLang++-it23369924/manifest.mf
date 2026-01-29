@@ -1,0 +1,4 @@
+Manifest-Version: 1.0
+Main-Class: Main
+Class-Path: lib/java-cup-11b-runtime.jar lib/java-cup-11b.jar
+

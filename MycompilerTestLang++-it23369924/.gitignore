@@ -1,0 +1,14 @@
+# Build outputs
+bin/
+
+# Generated sources
+src/lexer/Yylex.java
+src/parser/
+GeneratedTests.java
+
+# IDE and OS noise
+.DS_Store
+Thumbs.db
+*.log
+
+app.jar

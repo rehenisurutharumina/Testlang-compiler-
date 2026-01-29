@@ -1,0 +1,369 @@
+/* JavaCUP 11b grammar for TestLang++ */
+
+import java.util.*;
+import java.util.regex.*;
+import java.io.*;
+
+action code {:
+  private String baseUrl = null;
+  private final Map<String,String> defaultHeaders = new LinkedHashMap<>();
+  private final Map<String,Object> vars = new LinkedHashMap<>();
+  private final StringBuilder testsOut = new StringBuilder();
+
+  private int currentTestRequestCount = 0;
+  private int currentTestAssertCount = 0;
+
+  private static String jstr(String s) {
+    StringBuilder sb = new StringBuilder(s.length() + 16);
+    for (int i = 0; i < s.length(); i++) {
+      char c = s.charAt(i);
+      if (c == '\\' || c == '"') sb.append('\\').append(c);
+      else if (c == '\r') sb.append("\\r");
+      else if (c == '\n') sb.append("\\n");
+      else sb.append(c);
+    }
+    return "\"" + sb.toString() + "\"";
+  }
+
+  private static class ReqExtras {
+    final List<String[]> headers = new ArrayList<>();
+    String body = null;
+    int bodyLine = -1;
+  }
+
+  private void errorAtLine(String message, int line) {
+    throw new RuntimeException("Parse error at line " + line + ": " + message);
+  }
+
+  // Expand $name variables inside strings. Unknown name -> error with line.
+  private String expand(String s, int line) {
+    if (s == null) return null;
+    StringBuffer out = new StringBuffer(s.length());
+    Matcher m = Pattern.compile("\\$([A-Za-z_][A-Za-z0-9_]*)").matcher(s);
+    while (m.find()) {
+      String name = m.group(1);
+      if (!vars.containsKey(name)) {
+        errorAtLine("Unknown variable $" + name, line);
+      }
+      Object v = vars.get(name);
+      String rep = String.valueOf(v);
+      rep = rep.replace("\\", "\\\\").replace("$", "\\$");
+      m.appendReplacement(out, rep);
+    }
+    m.appendTail(out);
+    return out.toString();
+  }
+
+  // Build a Java expression for URI.create(...):
+  // - If expanded starts with '/', require baseUrl present -> return BASE + "<path>"
+  // - If no base and not http(s), error
+  // - Else return "<expanded>"
+  private String urlExprForJava(String raw, int line) {
+    String expanded = expand(raw, line);
+    if (expanded.startsWith("/")) {
+      if (baseUrl != null && !baseUrl.isEmpty()) {
+        return "BASE + " + jstr(expanded);
+      } else {
+        errorAtLine("Path must be absolute when base_url is absent", line);
+      }
+    } else {
+      if ((baseUrl == null || baseUrl.isEmpty()) &&
+          !(expanded.startsWith("http://") || expanded.startsWith("https://"))) {
+        errorAtLine("Path must be absolute when base_url is absent", line);
+      }
+    }
+    return jstr(expanded);
+  }
+
+  private static String sanitizeTestName(String ident) {
+    StringBuilder sb = new StringBuilder();
+    for (int i = 0; i < ident.length(); i++) {
+      char c = ident.charAt(i);
+      if (Character.isLetterOrDigit(c) || c == '_') sb.append(c);
+      else sb.append('_');
+    }
+    return sb.toString();
+  }
+
+  private void openTest(String name) {
+    currentTestRequestCount = 0;
+    currentTestAssertCount = 0;
+    String m = "test_" + sanitizeTestName(name);
+    testsOut.append("  @Test\n");
+    testsOut.append("  public void ").append(m).append("() throws Exception {\n");
+  }
+
+  private void closeTest(int lineForError) {
+    if (currentTestRequestCount < 1) {
+      errorAtLine("Test block requires =1 request", lineForError);
+    }
+    if (currentTestAssertCount < 2) {
+      errorAtLine("Test block requires =2 assertions", lineForError);
+    }
+    testsOut.append("  }\n\n");
+  }
+
+  private void emitRequest(String method, String urlExpr, ReqExtras extras, int line) {
+    testsOut.append("    HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(")
+            .append(urlExpr).append("))")
+            .append(".timeout(Duration.ofSeconds(10));\n");
+    testsOut.append("    for (var e : DEFAULT_HEADERS.entrySet()) b.header(e.getKey(), e.getValue());\n");
+    for (String[] kv : extras.headers) {
+      String k = jstr(expand(kv[0], line));
+      String v = jstr(expand(kv[1], line));
+      testsOut.append("    b.header(").append(k).append(", ").append(v).append(");\n");
+    }
+    boolean hasBody = extras.body != null;
+    if (method.equals("GET")) {
+      testsOut.append("    b.GET();\n");
+    } else if (method.equals("DELETE")) {
+      testsOut.append("    b.DELETE();\n");
+    } else if (method.equals("POST")) {
+      if (hasBody) {
+        String body = jstr(expand(extras.body, extras.bodyLine));
+        testsOut.append("    b.POST(HttpRequest.BodyPublishers.ofString(").append(body).append("));\n");
+      } else {
+        testsOut.append("    b.POST(HttpRequest.BodyPublishers.noBody());\n");
+      }
+    } else if (method.equals("PUT")) {
+      if (hasBody) {
+        String body = jstr(expand(extras.body, extras.bodyLine));
+        testsOut.append("    b.PUT(HttpRequest.BodyPublishers.ofString(").append(body).append("));\n");
+      } else {
+        testsOut.append("    b.PUT(HttpRequest.BodyPublishers.noBody());\n");
+      }
+    }
+    testsOut.append("    HttpResponse<String> resp = client.send(b.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));\n");
+    currentTestRequestCount++;
+  }
+
+  private void emitAssertStatus(int n) {
+    testsOut.append("    assertEquals(").append(n).append(", resp.statusCode());\n");
+    currentTestAssertCount++;
+  }
+
+  private void emitAssertHeaderEq(String key, int keyLine, String val, int valLine) {
+    String k = jstr(expand(key, keyLine));
+    String v = jstr(expand(val, valLine));
+    testsOut.append("    assertEquals(").append(v)
+            .append(", resp.headers().firstValue(").append(k).append(").orElse(\"\"));\n");
+    currentTestAssertCount++;
+  }
+
+  private void emitAssertHeaderContains(String key, int keyLine, String sub, int subLine) {
+    String k = jstr(expand(key, keyLine));
+    String s = jstr(expand(sub, subLine));
+    testsOut.append("    assertTrue(resp.headers().firstValue(").append(k)
+            .append(").orElse(\"\").contains(").append(s).append("));\n");
+    currentTestAssertCount++;
+  }
+
+  private void emitAssertBodyContains(String sub, int subLine) {
+    String s = jstr(expand(sub, subLine));
+    testsOut.append("    assertTrue(resp.body().contains(").append(s).append("));\n");
+    currentTestAssertCount++;
+  }
+
+  private void writeGeneratedFile() throws Exception {
+    StringBuilder out = new StringBuilder(4096);
+    out.append("import org.junit.jupiter.api.*;\n");
+    out.append("import static org.junit.jupiter.api.Assertions.*;\n");
+    out.append("import java.net.http.*; import java.net.*; import java.time.Duration;\n");
+    out.append("import java.nio.charset.StandardCharsets; import java.util.*;\n\n");
+    out.append("public class GeneratedTests {\n");
+    out.append("  static String BASE = ").append(jstr(baseUrl == null ? "" : baseUrl)).append(";\n");
+    out.append("  static Map<String,String> DEFAULT_HEADERS = new HashMap<>();\n");
+    out.append("  static HttpClient client;\n\n");
+    out.append("  @BeforeAll\n");
+    out.append("  static void setup() {\n");
+    out.append("    client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();\n");
+    for (Map.Entry<String,String> e : defaultHeaders.entrySet()) {
+      out.append("    DEFAULT_HEADERS.put(").append(jstr(e.getKey()))
+         .append(", ").append(jstr(e.getValue())).append(");\n");
+    }
+    out.append("  }\n\n");
+    out.append(testsOut);
+    out.append("}\n");
+    try (FileWriter fw = new FileWriter("GeneratedTests.java", false)) {
+      fw.write(out.toString());
+    }
+  }
+:}
+
+parser code {:
+  @Override
+  public void report_error(String message, Object info) {
+    if (info instanceof java_cup.runtime.Symbol) {
+      java_cup.runtime.Symbol s = (java_cup.runtime.Symbol) info;
+      System.err.println("Syntax error at line " + s.left + ": " + message);
+    } else {
+      System.err.println("Syntax error: " + message);
+    }
+  }
+:}
+
+terminal LBRACE, RBRACE, SEMI, EQ;
+terminal CONFIG, BASE_URL, HEADER, LET, TEST, GET, POST, PUT, DELETE, EXPECT, STATUS, BODY, CONTAINS;
+terminal String IDENT, STRING;
+terminal Integer NUMBER;
+non terminal program;
+non terminal opt_config;
+non terminal config_items;
+non terminal config_item;
+non terminal decls;
+non terminal decl;
+non terminal tests;
+non terminal test;
+non terminal test_items;
+non terminal test_item;
+non terminal request;
+non terminal ReqExtras request_block_opt;
+non terminal ReqExtras req_items;
+non terminal asserts_opt;
+non terminal assert_stmt;
+
+start with program;
+
+program ::= 
+  opt_config decls tests
+  {: 
+     try { writeGeneratedFile(); }
+     catch (Exception ex) { throw new RuntimeException("Failed to write GeneratedTests.java: " + ex.getMessage(), ex); }
+   :}
+  ;
+
+opt_config ::= 
+  /* empty */
+| CONFIG LBRACE config_items RBRACE
+  {: /* side effects already applied in config_items */ :}
+  ;
+
+config_items ::= 
+  /* empty */
+| config_items config_item
+  ;
+
+config_item ::= 
+  BASE_URL EQ STRING:s SEMI
+    {: baseUrl = s; :}
+| HEADER STRING:k EQ STRING:v SEMI
+    {: defaultHeaders.put(k, v); :}
+  ;
+
+decls ::= 
+  /* empty */
+| decls decl
+  ;
+
+decl ::= 
+  LET IDENT:id EQ STRING:s SEMI
+    {: 
+       if (vars.containsKey(id)) errorAtLine("Duplicate variable name", idleft);
+       vars.put(id, s);
+     :}
+| LET IDENT:id EQ NUMBER:n SEMI
+    {: 
+       if (vars.containsKey(id)) errorAtLine("Duplicate variable name", idleft);
+       vars.put(id, n);
+     :}
+  ;
+
+tests ::= 
+  test
+| tests test
+  ;
+
+test ::= 
+  TEST IDENT:name LBRACE
+    {: 
+       openTest(name);
+     :}
+  test_items RBRACE:rb
+    {: 
+       closeTest(rbleft);
+     :}
+  ;
+
+test_items ::= 
+  test_item
+| test_items test_item
+  ;
+
+test_item ::= 
+  request SEMI asserts_opt
+  ;
+
+request ::= 
+  GET STRING:path
+    {:
+       ReqExtras ex = new ReqExtras();
+       String url = urlExprForJava(path, pathleft);
+       emitRequest("GET", url, ex, pathleft);
+     :}
+| DELETE STRING:path
+    {:
+       ReqExtras ex = new ReqExtras();
+       String url = urlExprForJava(path, pathleft);
+       emitRequest("DELETE", url, ex, pathleft);
+     :}
+| POST STRING:path request_block_opt:rb
+    {:
+       String url = urlExprForJava(path, pathleft);
+       emitRequest("POST", url, rb == null ? new ReqExtras() : rb, pathleft);
+     :}
+| PUT STRING:path request_block_opt:rb
+    {:
+       String url = urlExprForJava(path, pathleft);
+       emitRequest("PUT", url, rb == null ? new ReqExtras() : rb, pathleft);
+     :}
+  ;
+
+request_block_opt ::= 
+  /* empty */ {: RESULT = new ReqExtras(); :}
+| LBRACE req_items:r RBRACE {: RESULT = r; :}
+  ;
+
+asserts_opt ::= 
+  /* empty */
+| asserts_opt assert_stmt
+  ;
+
+assert_stmt ::= 
+  EXPECT STATUS EQ NUMBER:n SEMI
+    {: emitAssertStatus(n.intValue()); :}
+| EXPECT HEADER STRING:k EQ STRING:v SEMI
+    {: emitAssertHeaderEq(k, kleft, v, vleft); :}
+| EXPECT HEADER STRING:k CONTAINS STRING:v SEMI
+    {: emitAssertHeaderContains(k, kleft, v, vleft); :}
+| EXPECT BODY CONTAINS STRING:s SEMI
+    {: emitAssertBodyContains(s, sleft); :}
+  ;
+
+
+/* Helper productions to actually accumulate req_items into ReqExtras */
+req_items ::= 
+  /* empty */ {: RESULT = new ReqExtras(); :}
+| req_items:acc HEADER STRING:k EQ STRING:v SEMI
+    {:
+       acc.headers.add(new String[]{k, v});
+       RESULT = acc;
+     :}
+| req_items:acc BODY EQ STRING:b SEMI
+    {:
+       if (acc.body != null) errorAtLine("Only one body is allowed per request", bleft);
+       acc.body = b;
+       acc.bodyLine = bleft;
+       RESULT = acc;
+     :}
+  ;
+
+
+
+
+
+
+
+
+
+
+
